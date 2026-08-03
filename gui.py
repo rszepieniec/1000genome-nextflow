@@ -108,6 +108,7 @@ def list_hf_runs():
         log_name = f"gui-hf-{cid}.log"
         out.append({"id": cid, "engine": "hyperflow", "date": fmt_date(cid),
                     "duration": run_duration(cid, running, [BASE / log_name, *results]),
+                    "prompt": _read_prompt_hf(cid),
                     "intent": intent, "status": status, "n_results": len(results),
                     "results": [r.name for r in results], "running": running,
                     "hf_log": log_name if (BASE / log_name).exists() else None,
@@ -193,6 +194,29 @@ def run_duration(run_id, running, end_paths):
         mtimes = [p.stat().st_mtime for p in end_paths if p and p.exists()]
         end = max(mtimes) if mtimes else start
     return _fmt_dur(end - start)
+
+def _read_prompt_nf(run_dir):
+    f = run_dir / "prompt.txt"
+    if f.exists():
+        try:
+            return f.read_text().strip() or None
+        except Exception:
+            return None
+    return None
+
+def _read_prompt_hf(cid):
+    """Prompt runu HyperFlow z tymczasowego .cases-<cid>.yaml (wstrzykniety przez GUI)."""
+    f = HF_INTEG / f".cases-{cid}.yaml"
+    if not f.exists():
+        return None
+    try:
+        import yaml
+        for c in (yaml.safe_load(f.read_text()) or {}).get("test_cases", []):
+            if c.get("id") == cid:
+                return (c.get("prompt") or "").strip() or None
+    except Exception:
+        return None
+    return None
 
 # Fazy harnessu HyperFlow -> bazowy % na starcie kazdej fazy (przed EXECUTE).
 HF_PHASES = [("INTERPRET", 5), ("PLAN", 12), ("EXTRACT", 22), ("GENERATE", 32), ("EXECUTE", 45)]
@@ -307,6 +331,73 @@ def list_pairs():
         g["hf"] = [max(g["hf"], key=lambda r: r["id"].replace("gui-", ""))]
     return pairs
 
+CMP_CACHE = BASE / ".compare-cache"
+
+def _collect_result_files(tarballs, dest, exts, keep=None):
+    """Rozpakowuje pliki o danych rozszerzeniach (i przechodzace `keep`) do dest. {basename: Path}."""
+    dest.mkdir(parents=True, exist_ok=True)
+    found = {}
+    for tb in tarballs:
+        try:
+            with tarfile.open(tb) as t:
+                for m in t.getmembers():
+                    if not m.isfile():
+                        continue
+                    bn = os.path.basename(m.name)
+                    if bn in found or not bn.lower().endswith(exts) or (keep and not keep(bn)):
+                        continue
+                    m.name = bn
+                    t.extract(m, dest)
+                    found[bn] = dest / bn
+        except Exception:
+            continue
+    return found
+
+def _pretty_plot(name):
+    """total_distribution_c6_sNO-SIFT_EUR.png -> 'total distribution · EUR (chr6)'."""
+    base = name.rsplit(".", 1)[0]
+    m = re.search(r"_c(\w+)_s([A-Z-]+)_([A-Z]+)$", base)
+    if m:
+        chrom, sift, pop = m.groups()
+        kind = base[: m.start()].replace("_", " ")
+        return f"{kind} · {pop} (chr{chrom})"
+    return base.replace("_", " ")
+
+def _results_dir(engine, rid):
+    return (RUNS / rid / "results") if engine == "nextflow" else (HF_INTEG / f"workflow-{rid}")
+
+def compare_results(a_eng, a_id, b_eng, b_id):
+    """Zestawia wykresy/txt DOWOLNYCH dwoch runow (dowolne silniki) — parowanie po nazwie pliku."""
+    da, db = _results_dir(a_eng, a_id), _results_dir(b_eng, b_id)
+    if not da.exists() or not db.exists():
+        return {"ok": False, "msg": "Brak folderu wyników po jednej ze stron."}
+    all_tb = lambda d: sorted(d.glob("chr*-*.tar.gz"))
+    main_tb = lambda d: [t for t in all_tb(d) if not t.name.endswith("-freq.tar.gz")]
+    cache = CMP_CACHE / re.sub(r"[^A-Za-z0-9_.-]", "_", f"{a_eng}-{a_id}__{b_eng}-{b_id}")
+    shutil.rmtree(cache, ignore_errors=True)
+    # PNG: tylko wykresy ZBIORCZE (100/colormap/half/total _distribution); pomijamy per-iteracyjne. TXT z glownych tarballi.
+    is_summary = lambda bn: "distribution" in bn.lower()
+    a_png = _collect_result_files(all_tb(da), cache / "a", (".png",), keep=is_summary)
+    b_png = _collect_result_files(all_tb(db), cache / "b", (".png",), keep=is_summary)
+    a_txt = _collect_result_files(main_tb(da), cache / "a", (".txt",))
+    b_txt = _collect_result_files(main_tb(db), cache / "b", (".txt",))
+    if not (a_png or b_png or a_txt or b_txt):
+        return {"ok": False, "msg": "Brak wypakowanych plików (czy runy się skończyły?)."}
+    rel = lambda p: str(p.relative_to(BASE)) if p else None
+    def build(am, bm):
+        out = []
+        for bn in sorted(set(am) | set(bm)):
+            out.append({"name": bn, "title": _pretty_plot(bn),
+                        "a": rel(am.get(bn)), "b": rel(bm.get(bn)),
+                        "both": bn in am and bn in bm})
+        out.sort(key=lambda i: (not i["both"], i["name"]))
+        return out
+    label = lambda e, i: ("HF " if e == "hyperflow" else "NF ") + i
+    pngs, txts = build(a_png, b_png), build(a_txt, b_txt)
+    return {"ok": True, "a_label": label(a_eng, a_id), "b_label": label(b_eng, b_id),
+            "pngs": pngs, "txts": txts, "n_png": len(pngs), "n_txt": len(txts),
+            "n_both": sum(1 for i in pngs if i["both"])}
+
 def list_runs():
     out = []
     for d in sorted(RUNS.glob("*"), key=lambda p: p.name, reverse=True):
@@ -341,11 +432,25 @@ def list_runs():
         else:
             status = "?"
         comparable = (REF_HF / "chr17-GBR-freq.tar.gz").exists() and (d / "results" / "chr17-GBR-freq.tar.gz").exists()
+        # tryb szybki: composer dopisuje --n_runs / --max_variants do komendy nextflow
+        fast = False
+        cmd_sh = d / "command.sh"
+        if cmd_sh.exists():
+            try:
+                c = cmd_sh.read_text()
+                fast = any(f in c for f in ("--n_runs", "--n-runs", "--max_variants", "--max-variants"))
+            except Exception:
+                fast = False
+        # dry-run: composer utworzyl run (intent+command), ale NIE odpalil nextflow (brak logu i wynikow)
+        dry = cmd_sh.exists() and not nextflow_log.exists() and not results and status != "w toku"
         out.append({
             "id": d.name,
             "engine": "nextflow",
             "date": fmt_date(d.name),
             "duration": run_duration(d.name, status == "w toku", [nextflow_log, *results]),
+            "fast": fast,
+            "dry": dry,
+            "prompt": _read_prompt_nf(d),
             "intent": intent,
             "status": status,
             "n_results": len(results),
@@ -453,6 +558,15 @@ td.dt{white-space:nowrap;color:#41506a;font-size:12px}
 tbody tr:hover{background:#fafcff}
 .seg{font-size:13px;color:#41506a;display:flex;align-items:center;gap:10px;background:#f2f6fc;border:1px solid #dbe6f5;border-radius:8px;padding:6px 12px}
 .seg label{display:flex;align-items:center;gap:4px;cursor:pointer;margin:0}
+.fastb{font-size:10px;background:#fff3cd;color:#8a6d00;border:1px solid #f0e0a0;border-radius:6px;padding:1px 6px;white-space:nowrap}
+.dryb{font-size:10px;background:#e7eefc;color:#3557a0;border:1px solid #c6d6f2;border-radius:6px;padding:1px 6px;white-space:nowrap}
+.promptlink{cursor:pointer;font-size:12px}
+.cmprow{margin:12px 0;border-top:1px solid #eef1f6;padding-top:10px}
+.cmptitle{font-weight:600;font-size:13px;margin-bottom:6px}
+.cmppair{display:flex;gap:14px;flex-wrap:wrap}
+.cmppair figure{margin:0;flex:1;min-width:280px}
+.cmppair figcaption{font-size:11.5px;color:#41506a;margin-bottom:3px}
+.cmpimg{width:100%;max-width:460px;border:1px solid #e0e6ef;border-radius:6px;background:#fff}
 </style></head><body>
 <header><h1>Composer 1000genome → Nextflow</h1>
 <p>Pytanie w języku naturalnym → intent (LLM) → tabix → workflow → wyniki. Region i populacje zależą od prompta.</p></header>
@@ -488,11 +602,13 @@ tbody tr:hover{background:#fafcff}
     <button class=sec onclick=refresh()>Odśwież</button>
   </div>
   <div id=pairs></div>
+  <div id=cmpview></div>
   <div class=filt id=filt>
     <button data-f=all class=on onclick="setFilter('all',this)">Oba</button>
     <button data-f=nextflow onclick="setFilter('nextflow',this)">Nextflow</button>
     <button data-f=hyperflow onclick="setFilter('hyperflow',this)">HyperFlow</button>
   </div>
+  <div id=promptbox></div>
   <div id=runs></div>
 </div>
 
@@ -518,6 +634,16 @@ tbody tr:hover{background:#fafcff}
 </div>
 <script>
 const $=id=>document.getElementById(id);
+function esc(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function closePrompt(){$('promptbox').innerHTML='';}
+function showPrompt(eng,id){
+  const x=(ALLRUNS||[]).find(r=>r.engine==eng&&r.id==id);
+  const p=x&&x.prompt?esc(x.prompt):'(prompt niezapisany dla tego runu)';
+  $('promptbox').innerHTML='<div class=card style="background:#f7fbff"><div class=row style="justify-content:space-between">'
+    +'<b>📝 Oryginalny prompt</b><button class="mini sec" onclick="closePrompt()">✕ zamknij</button></div>'
+    +'<div class=muted>'+eng+' · '+id+'</div><pre style="white-space:pre-wrap;background:#fff;color:#1a2230;border:1px solid #e0e6ef">'+p+'</pre></div>';
+  $('promptbox').scrollIntoView({behavior:'smooth',block:'nearest'});
+}
 function setChip(t){$('prompt').value=t}
 async function dry(){
   $('out').innerHTML='<span class=muted>Interpretuję…</span>';
@@ -632,7 +758,10 @@ function renderRuns(){
   let h='<table><tr><th>Silnik</th><th>Data</th><th>Czas</th><th>Przebieg</th><th>Intent</th><th>Status</th><th>Wyniki</th><th>Raporty</th><th>Akcje</th></tr>';
   for(const x of rows){
     const dur=(x.duration||'')+(x.running&&x.duration?' …':'');
-    h+='<tr><td>'+engBadge(x.engine)+'</td><td class=dt>'+(x.date||'')+'</td><td class=dt>'+dur+'</td><td>'+x.id+'</td><td>'+isummary(x.intent)+'</td><td>'+badge(x.status)+progHtml(x)+'</td><td>'+x.n_results+' plików</td><td>'+(runLinks(x)||'—')+'</td><td>'+(stopBtn(x)||'—')+'</td></tr>';
+    const fast=x.fast?' <span class=fastb title="tryb szybki: mniej wariantów / 100 iteracji Monte Carlo — wpływa na analizę">⚡ szybki</span>':'';
+    const dry=x.dry?' <span class=dryb title="dry-run: tylko podgląd intentu, bez uruchomienia pipeline">🔍 dry-run</span>':'';
+    const pl=x.prompt?' <span class=promptlink title="pokaż oryginalny prompt" data-e="'+x.engine+'" data-i="'+x.id+'" onclick="showPrompt(this.dataset.e,this.dataset.i)">📝</span>':'';
+    h+='<tr><td>'+engBadge(x.engine)+'</td><td class=dt>'+(x.date||'')+'</td><td class=dt>'+dur+'</td><td>'+x.id+fast+dry+'</td><td>'+isummary(x.intent)+pl+'</td><td>'+badge(x.status)+progHtml(x)+'</td><td>'+x.n_results+' plików</td><td>'+(runLinks(x)||'—')+'</td><td>'+(stopBtn(x)||'—')+'</td></tr>';
   }
   h+='</table>';$('runs').innerHTML=h;
 }
@@ -662,17 +791,64 @@ async function stopRun(id){
   const r=await fetch('/api/stop?id='+id);const j=await r.json();
   alert(j.msg||(j.ok?'zatrzymano':'nie udało się'));refresh();
 }
+function cmpBtn(el){const a=el.dataset.a.split('|'),b=el.dataset.b.split('|');cmp(a[0],a[1],b[0],b[1]);}
+function runOpt(x){return '<option value="'+x.engine+'|'+x.id+'">'+(x.engine=='hyperflow'?'HF':'NF')+' '+x.id+' — '+isummary(x.intent)+' ('+x.n_results+' plików)</option>';}
+function openManualCompare(){
+  const withRes=(ALLRUNS||[]).filter(x=>x.n_results>0);
+  if(withRes.length<2){$('cmpview').innerHTML='<div class=card><span class=muted>Za mało runów z wynikami (potrzeba ≥2).</span></div>';$('cmpview').scrollIntoView({behavior:'smooth'});return;}
+  const opts=withRes.map(runOpt).join('');
+  $('cmpview').innerHTML='<div class=card style="background:#f4f8ff"><div class=row style="justify-content:space-between"><b>⚖️ Porównaj dowolne 2 runy</b><button class="mini sec" onclick="closeCmp()">✕</button></div>'
+    +'<div class=row style="margin-top:8px;gap:8px;align-items:center;flex-wrap:wrap"><span class=muted>A:</span><select id=cmpA>'+opts+'</select><span class=muted>B:</span><select id=cmpB>'+opts+'</select><button onclick="runManualCompare()">Porównaj wykresy</button></div></div>';
+  $('cmpview').scrollIntoView({behavior:'smooth'});
+}
+function runManualCompare(){const a=$('cmpA').value.split('|'),b=$('cmpB').value.split('|');cmp(a[0],a[1],b[0],b[1]);}
 async function loadPairs(){
   const r=await fetch('/api/pairs');const ps=await r.json();
-  if(!ps.length){$('pairs').innerHTML='<p class=muted>Brak par — uruchom ten sam prompt na Nextflow i HyperFlow (te same wejścia), a pojawią się tu obok siebie do przejrzenia.</p>';return;}
   const side=(arr,eng)=>arr.map(r=>{
     const attr=eng=='nf'?('data-p="'+r.folder+'" onclick="openFolder(this.dataset.p)"'):('data-id="'+r.id+'" onclick="openHF(this.dataset.id)"');
     return '<div style=margin:2px 0><a class=link style=cursor:pointer '+attr+'>📂 '+r.id+'</a> <span class=muted>'+(r.date||'')+' · '+r.n_results+' plików</span></div>';
   }).join('')||'<span class=muted>—</span>';
-  let h='<div class=card style="background:#eef6ff;margin-bottom:14px"><b>Pary runów — te same wejścia (Nextflow ↔ HyperFlow)</b> <span class=muted>· kliknij, aby otworzyć folder z plikami</span>'
-       +'<table style=margin-top:8px><tr><th>Wejście (intent)</th><th>Nextflow</th><th>HyperFlow</th></tr>';
-  for(const g of ps) h+='<tr><td>'+g.label+'</td><td>'+side(g.nf,'nf')+'</td><td>'+side(g.hf,'hf')+'</td></tr>';
-  h+='</table></div>';$('pairs').innerHTML=h;
+  let h='<div class=card style="background:#eef6ff;margin-bottom:14px"><div class=row style="justify-content:space-between"><b>Porównania wyników</b>'
+       +'<button class=mini onclick="openManualCompare()">⚖️ Porównaj dowolne 2 runy</button></div>';
+  if(!ps.length){
+    h+='<p class=muted style="margin-top:8px">Brak automatycznych par (ten sam prompt na NF i HF). Dowolne 2 runy porównasz przyciskiem wyżej.</p>';
+  }else{
+    h+='<div class=muted style="margin-top:6px">Automatyczne pary (te same wejścia) — otwórz folder albo zestaw wykresy:</div>'
+      +'<table style=margin-top:6px><tr><th>Wejście (intent)</th><th>Nextflow</th><th>HyperFlow</th><th>Porównanie</th></tr>';
+    for(const g of ps){
+      const nfid=g.nf[0]?g.nf[0].id:'', hfid=g.hf[0]?g.hf[0].id:'';
+      const btn=(nfid&&hfid)?'<button class=mini data-a="nextflow|'+nfid+'" data-b="hyperflow|'+hfid+'" onclick="cmpBtn(this)">🔍 Porównaj wykresy</button>':'<span class=muted>—</span>';
+      h+='<tr><td>'+g.label+'</td><td>'+side(g.nf,'nf')+'</td><td>'+side(g.hf,'hf')+'</td><td>'+btn+'</td></tr>';
+    }
+    h+='</table>';
+  }
+  h+='</div>';$('pairs').innerHTML=h;
+}
+function closeCmp(){$('cmpview').innerHTML='';}
+async function cmp(aEng,aId,bEng,bId){
+  $('cmpview').innerHTML='<div class=card><span class=muted>Wypakowuję i zestawiam wyniki…</span></div>';
+  const q='a_eng='+aEng+'&a='+encodeURIComponent(aId)+'&b_eng='+bEng+'&b='+encodeURIComponent(bId);
+  const r=await fetch('/api/compare?'+q);const j=await r.json();
+  if(!j.ok){$('cmpview').innerHTML='<div class=card><span class=muted>'+(j.msg||'nie udało się')+'</span></div>';return;}
+  let h='<div class=card><div class=row style="justify-content:space-between"><b>Porównanie wykresów</b>'
+       +'<button class="mini sec" onclick="closeCmp()">✕ zamknij</button></div>'
+       +'<div class=muted style="margin:4px 0">A: '+j.a_label+'  ·  B: '+j.b_label+'  ·  '+j.n_png+' wykresów ('+j.n_both+' par pasujących obie strony)</div>';
+  const img=p=>p?'<img class=cmpimg src="/file?p='+encodeURIComponent(p)+'">':'<span class=muted>(brak)</span>';
+  for(const it of j.pngs){
+    h+='<div class=cmprow><div class=cmptitle>'+it.title+'</div><div class=cmppair>'
+      +'<figure><figcaption>'+j.a_label+'</figcaption>'+img(it.a)+'</figure>'
+      +'<figure><figcaption>'+j.b_label+'</figcaption>'+img(it.b)+'</figure></div></div>';
+  }
+  if(j.txts&&j.txts.length){
+    h+='<details style=margin-top:8px><summary style="cursor:pointer;color:#1565c0">Pliki tekstowe ('+j.n_txt+') — otwórz obok siebie</summary><table style=margin-top:6px><tr><th>Plik</th><th>'+j.a_label+'</th><th>'+j.b_label+'</th></tr>';
+    for(const it of j.txts){
+      const lnk=(p,l)=>p?'<a class=link target=_blank href="/file?p='+encodeURIComponent(p)+'">'+l+'</a>':'<span class=muted>—</span>';
+      h+='<tr><td>'+it.name+'</td><td>'+lnk(it.a,'otwórz')+'</td><td>'+lnk(it.b,'otwórz')+'</td></tr>';
+    }
+    h+='</table></details>';
+  }
+  h+='</div>';$('cmpview').innerHTML=h;
+  $('cmpview').scrollIntoView({behavior:'smooth'});
 }
 function tick(){refresh();loadPairs();}
 tick();setInterval(tick,5000);
@@ -715,6 +891,11 @@ class H(BaseHTTPRequestHandler):
                 self._send(200, "application/json", json.dumps({"ok": False, "msg": "brak folderu"}).encode())
         elif u.path == "/api/pairs":
             self._send(200, "application/json", json.dumps(list_pairs()).encode())
+        elif u.path == "/api/compare":
+            q = parse_qs(u.query)
+            self._send(200, "application/json", json.dumps(compare_results(
+                q.get("a_eng", ["nextflow"])[0], q.get("a", [""])[0],
+                q.get("b_eng", ["hyperflow"])[0], q.get("b", [""])[0])).encode())
         elif u.path == "/file":
             p = parse_qs(u.query).get("p", [""])[0]
             target = (BASE / p).resolve()

@@ -35,3 +35,6 @@ __pycache__/
 *.pdf
 presentation-*.md
 build_slides.py
+
+# cache porownywarki wykresow (wypakowane png/txt)
+.compare-cache/

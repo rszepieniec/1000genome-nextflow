@@ -115,6 +115,7 @@ def main() -> int:
 
     print(f"[composer] Run dir: {run_dir}")
     print(f"[composer] Prompt:  {args.prompt}")
+    (run_dir / "prompt.txt").write_text(args.prompt)   # oryginalny prompt do historii w GUI
 
     # ---- FAZA 1: INTERPRET (REUSE) ----
     print(f"\n[composer] Faza 1: INTERPRET (reuse workflow_composer, model={args.model})")
